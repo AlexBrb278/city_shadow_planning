@@ -2,8 +2,7 @@
 
 Mobile app + Python backend computing walking routes through Bucharest that
 prefer shaded streets, using OSM building footprints/heights and sun
-position. See [CLAUDE.md](CLAUDE.md) (gitignored, local planning doc) for
-the full phased build plan.
+position. 
 
 ## Current state
 
