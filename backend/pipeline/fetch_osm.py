@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Fetch OSM building footprints + heights for the Umbra bbox and cache them
-locally as GeoJSON (WGS84) for the frontend's 3D building layer.
+Fetch OSM building footprints + heights and the walking street network for
+the Umbra bbox. Caches everything to backend/data/ so Overpass is never hit
+twice for the same bbox.
 
 Usage:
-  python fetch_osm.py            # use cached file if present
+  python fetch_osm.py            # use cached files if present
   python fetch_osm.py --refresh  # re-fetch from Overpass even if cached
 """
 
@@ -12,51 +13,29 @@ import argparse
 import json
 from pathlib import Path
 
+from heights import resolve_height, build_buildings_parquet
+
 BBOX = dict(north=44.4340, south=44.4280, east=26.1060, west=26.0960)
-METERS_PER_LEVEL = 3.0
 
-# Fallback height by building type when neither height nor levels tag exists.
-TYPE_HEIGHT_M = {
-    "apartments": 10 * METERS_PER_LEVEL,
-    "residential": 2 * METERS_PER_LEVEL,
-    "house": 2 * METERS_PER_LEVEL,
-    "church": 15.0,
-    "retail": 4 * METERS_PER_LEVEL,
-    "commercial": 4 * METERS_PER_LEVEL,
-}
-DEFAULT_HEIGHT_M = 8.0
-
+PIPELINE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
-CACHE_FILE = DATA_DIR / "buildings.geojson"
+BUILDINGS_GEOJSON = DATA_DIR / "buildings.geojson"
+BUILDINGS_PARQUET = DATA_DIR / "buildings.parquet"
+STREET_NETWORK_GRAPHML = DATA_DIR / "street_network.graphml"
 
 
-def resolve_height(raw_h, raw_l, building_type):
-    """height tag -> levels * 3.0 -> fallback by building type -> default."""
-    if raw_h is not None and str(raw_h) != "nan":
-        try:
-            return float(str(raw_h).replace("m", "").strip()), "height"
-        except ValueError:
-            pass
-    if raw_l is not None and str(raw_l) != "nan":
-        try:
-            return float(raw_l) * METERS_PER_LEVEL, "levels"
-        except ValueError:
-            pass
-    if building_type in TYPE_HEIGHT_M:
-        return TYPE_HEIGHT_M[building_type], "type_fallback"
-    return DEFAULT_HEIGHT_M, "default"
-
-
-def fetch_buildings():
-    """Fetch buildings from Overpass via osmnx. Returns a GeoJSON dict
-    (WGS84) with height_m / height_source properties per feature."""
+def _fetch_buildings_gdf():
     import osmnx as ox
 
-    gdf = ox.features_from_bbox(
+    ox.settings.cache_folder = str(PIPELINE_DIR / "cache")
+    return ox.features_from_bbox(
         bbox=(BBOX["west"], BBOX["south"], BBOX["east"], BBOX["north"]),
         tags={"building": True},
     )
 
+
+def _buildings_gdf_to_geojson(gdf):
+    """WGS84 GeoJSON FeatureCollection for the frontend's 3D building layer."""
     features = []
     stats = {"height": 0, "levels": 0, "type_fallback": 0, "default": 0}
     for _, row in gdf.iterrows():
@@ -87,16 +66,47 @@ def fetch_buildings():
     return {"type": "FeatureCollection", "features": features}
 
 
+def fetch_buildings():
+    """Fetch buildings once from Overpass and write both artifacts:
+    buildings.geojson (WGS84, for the frontend) and buildings.parquet
+    (UTM 32635, for the shadow/routing pipeline)."""
+    gdf = _fetch_buildings_gdf()
+    fc = _buildings_gdf_to_geojson(gdf)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    build_buildings_parquet(gdf, BUILDINGS_PARQUET)
+    return fc
+
+
+def fetch_street_network(refresh=False):
+    """Fetch (or load cached) walking street network graph for the bbox."""
+    import osmnx as ox
+
+    ox.settings.cache_folder = str(PIPELINE_DIR / "cache")
+    if STREET_NETWORK_GRAPHML.exists() and not refresh:
+        print(f"Using cached street network: {STREET_NETWORK_GRAPHML}")
+        return ox.load_graphml(STREET_NETWORK_GRAPHML)
+
+    g = ox.graph_from_bbox(
+        bbox=(BBOX["west"], BBOX["south"], BBOX["east"], BBOX["north"]),
+        network_type="walk",
+    )
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ox.save_graphml(g, STREET_NETWORK_GRAPHML)
+    print(f"Wrote {STREET_NETWORK_GRAPHML} ({len(g.nodes)} nodes, {len(g.edges)} edges)")
+    return g
+
+
 def load_buildings(refresh=False):
-    """Cache-first accessor: read CACHE_FILE unless missing or --refresh."""
-    if CACHE_FILE.exists() and not refresh:
-        print(f"Using cached buildings: {CACHE_FILE}")
-        return json.loads(CACHE_FILE.read_text())
+    """Cache-first accessor for the frontend: read buildings.geojson unless
+    missing, buildings.parquet missing, or --refresh."""
+    if BUILDINGS_GEOJSON.exists() and BUILDINGS_PARQUET.exists() and not refresh:
+        print(f"Using cached buildings: {BUILDINGS_GEOJSON}")
+        return json.loads(BUILDINGS_GEOJSON.read_text())
 
     fc = fetch_buildings()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    CACHE_FILE.write_text(json.dumps(fc))
-    print(f"Wrote {CACHE_FILE} ({len(fc['features'])} features)")
+    BUILDINGS_GEOJSON.write_text(json.dumps(fc))
+    print(f"Wrote {BUILDINGS_GEOJSON} ({len(fc['features'])} features)")
     return fc
 
 
@@ -105,6 +115,7 @@ def main():
     ap.add_argument("--refresh", action="store_true", help="bypass cache, re-fetch from Overpass")
     args = ap.parse_args()
     load_buildings(refresh=args.refresh)
+    fetch_street_network(refresh=args.refresh)
 
 
 if __name__ == "__main__":
