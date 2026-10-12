@@ -1,7 +1,16 @@
 <script lang="ts">
-	import { onMount, onDestroy } from 'svelte';
-	import { Map as MaplibreMap, NavigationControl } from 'maplibre-gl';
+	import { onMount } from 'svelte';
+	import {
+		Map as MaplibreMap,
+		NavigationControl,
+		type GeoJSONSource,
+		type LightSpecification
+	} from 'maplibre-gl';
 	import 'maplibre-gl/dist/maplibre-gl.css';
+	import type { FeatureCollection } from 'geojson';
+	import { fetchBuildings, type Shadows } from '$lib/api';
+
+	let { shadows }: { shadows: Shadows | null } = $props();
 
 	// Umbra bbox - central Bucharest (Lipscani / Old Town), kept in sync with
 	// backend/pipeline/fetch_osm.py BBOX. Do not expand without updating both.
@@ -11,13 +20,20 @@
 		(BBOX.north + BBOX.south) / 2
 	];
 
-	const API_BASE = 'http://localhost:8000';
+	const EMPTY: FeatureCollection = { type: 'FeatureCollection', features: [] };
+	// MapLibre's built-in default, used while the sun is down.
+	const DEFAULT_LIGHT: LightSpecification = {
+		anchor: 'viewport',
+		position: [1.15, 210, 30],
+		intensity: 0.5
+	};
 
 	let container: HTMLDivElement;
-	let map: MaplibreMap;
+	let map: MaplibreMap | undefined;
+	let loaded = $state(false);
 
 	onMount(() => {
-		map = new MaplibreMap({
+		const m = new MaplibreMap({
 			container,
 			style: {
 				version: 8,
@@ -35,18 +51,32 @@
 			zoom: 16.5,
 			pitch: 60,
 			bearing: -17,
-			antialias: true
+			canvasContextAttributes: { antialias: true }
 		});
+		map = m;
 
-		map.addControl(new NavigationControl());
+		m.addControl(new NavigationControl());
 
-		map.on('load', async () => {
-			const res = await fetch(`${API_BASE}/buildings`);
-			const buildings = await res.json();
+		// 'style.load' rather than 'load': our layers don't depend on basemap
+		// tiles, and 'load' waits for all of them - on a slow connection it
+		// holds back buildings and shade, and if tiles fail it may never fire.
+		m.once('style.load', async () => {
+			// Added before the buildings so it draws underneath them.
+			m.addSource('shade', { type: 'geojson', data: EMPTY });
+			m.addLayer({
+				id: 'shade',
+				type: 'fill',
+				source: 'shade',
+				paint: {
+					'fill-color': '#1e2a44',
+					'fill-opacity': 0.45
+				}
+			});
+			loaded = true;
 
-			map.addSource('buildings', { type: 'geojson', data: buildings });
+			m.addSource('buildings', { type: 'geojson', data: await fetchBuildings() });
 
-			map.addLayer({
+			m.addLayer({
 				id: 'buildings-3d',
 				type: 'fill-extrusion',
 				source: 'buildings',
@@ -66,11 +96,24 @@
 			});
 		});
 
-		return () => map.remove();
+		return () => m.remove();
 	});
 
-	onDestroy(() => {
-		map?.remove();
+	// Keep the shade layer, and the light on the extrusions, in step with the
+	// sun. MapLibre's polar angle is measured from straight overhead.
+	$effect(() => {
+		if (!loaded || !map) return;
+		(map.getSource('shade') as GeoJSONSource).setData(shadows ?? EMPTY);
+		const sun = shadows?.sun;
+		map.setLight(
+			sun?.is_up
+				? {
+						anchor: 'map',
+						position: [1.15, sun.azimuth_deg, 90 - sun.elevation_deg],
+						intensity: 0.5
+					}
+				: DEFAULT_LIGHT
+		);
 	});
 </script>
 

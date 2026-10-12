@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+osmnx>=2.0      # features_from_bbox(bbox=(west, south, east, north)) signature
+shapely>=2.0    # vectorised shapely.polygons / union_all / transform
+pyproj
+pysolar
+numpy
+tzdata          # zoneinfo has no timezone database of its own on Windows
+matplotlib      # shadow_poc.py rendering only
+
+# tests
+pytest
+httpx           # fastapi.testclient
