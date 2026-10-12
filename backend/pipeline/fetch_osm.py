@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
 """
-Fetch OSM building footprints + heights for the Umbra bbox and cache them
-locally as GeoJSON (WGS84) for the frontend's 3D building layer.
+Download every building in Bucharest from OpenStreetMap, give each one a
+height, and cache the result as GeoParquet for the API.
 
 Usage:
-  python fetch_osm.py            # use cached file if present
-  python fetch_osm.py --refresh  # re-fetch from Overpass even if cached
+  python fetch_osm.py            # use the cached file if present
+  python fetch_osm.py --refresh  # re-download (a city-sized download takes several minutes)
 """
 
 import argparse
-import json
 from pathlib import Path
 
-BBOX = dict(north=44.4340, south=44.4280, east=26.1060, west=26.0960)
-METERS_PER_LEVEL = 3.0
+import geopandas as gpd
+import numpy as np
+import pandas as pd
 
-# Fallback height by building type when neither height nor levels tag exists.
+# Nominatim resolves this to the municipality boundary (sectors 1-6).
+PLACE = "Bucharest, Romania"
+
+# Overpass times out on one city-sized query, so osmnx splits the area into
+# sub-queries no larger than this (5 km x 5 km) and merges the results.
+MAX_QUERY_AREA_M2 = 25_000_000
+REQUEST_TIMEOUT_S = 300
+
+METERS_PER_LEVEL = 3.0
+# Typical height by building type, for buildings with no height or levels tag.
 TYPE_HEIGHT_M = {
     "apartments": 10 * METERS_PER_LEVEL,
     "residential": 2 * METERS_PER_LEVEL,
@@ -27,82 +36,98 @@ TYPE_HEIGHT_M = {
 DEFAULT_HEIGHT_M = 8.0
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
-CACHE_FILE = DATA_DIR / "buildings.geojson"
+CACHE_FILE = DATA_DIR / "buildings.parquet"
 
 
-def resolve_height(raw_h, raw_l, building_type):
-    """height tag -> levels * 3.0 -> fallback by building type -> default."""
-    if raw_h is not None and str(raw_h) != "nan":
-        try:
-            return float(str(raw_h).replace("m", "").strip()), "height"
-        except ValueError:
-            pass
-    if raw_l is not None and str(raw_l) != "nan":
-        try:
-            return float(raw_l) * METERS_PER_LEVEL, "levels"
-        except ValueError:
-            pass
-    if building_type in TYPE_HEIGHT_M:
-        return TYPE_HEIGHT_M[building_type], "type_fallback"
-    return DEFAULT_HEIGHT_M, "default"
+def positive_number(values):
+    """Parse OSM tag values like '12', '12 m', '12m' or '3' to floats.
+    Anything unparseable ('12 ft', '3;4') or not above zero becomes NaN."""
+    cleaned = values.astype("string").str.removesuffix("m").str.strip()
+    numbers = pd.to_numeric(cleaned, errors="coerce")
+    return numbers.where(numbers > 0)
 
 
-def fetch_buildings():
-    """Fetch buildings from Overpass via osmnx. Returns a GeoJSON dict
-    (WGS84) with height_m / height_source properties per feature."""
+def resolve_heights(tags):
+    """Height in metres for each row of OSM `tags`, and where it came from.
+
+    Takes the first of: the height tag, building:levels x 3 m, a typical
+    height for the building type, or 8 m. Returns (heights, sources)."""
+    missing = pd.Series(np.nan, index=tags.index)
+    explicit = positive_number(tags.get("height", missing))
+    from_levels = positive_number(tags.get("building:levels", missing)) * METERS_PER_LEVEL
+    by_type = tags.get("building", missing).map(TYPE_HEIGHT_M)
+
+    heights = explicit.fillna(from_levels).fillna(by_type).fillna(DEFAULT_HEIGHT_M)
+    sources = np.select(
+        [explicit.notna(), from_levels.notna(), by_type.notna()],
+        ["height", "levels", "type_fallback"],
+        default="default",
+    )
+    return heights.astype(float), pd.Series(sources, index=tags.index)
+
+
+def polygons_only(gdf):
+    """Repair invalid footprints and split multipolygons, leaving one plain
+    Polygon per row (each part keeps its building's attributes)."""
+    gdf = gdf.set_geometry(gdf.make_valid())
+    # make_valid can return a collection that itself holds a MultiPolygon,
+    # so explode twice to be sure only single parts remain.
+    gdf = gdf.explode(index_parts=False).explode(index_parts=False)
+    return gdf[gdf.geom_type == "Polygon"].reset_index(drop=True)
+
+
+def print_height_coverage(sources):
+    counts = sources.value_counts()
+    total = len(sources) or 1
+    print(f"OSM buildings: {len(sources)}")
+    for source in ["height", "levels", "type_fallback", "default"]:
+        n = counts.get(source, 0)
+        print(f"  {source:14s}: {n:7d} ({100 * n / total:.1f}%)")
+
+
+def fetch_buildings(place=PLACE):
+    """Download the buildings of `place` from Overpass. Returns a
+    GeoDataFrame (WGS84) with height_m, height_source, building_type, osm_id."""
     import osmnx as ox
 
-    gdf = ox.features_from_bbox(
-        bbox=(BBOX["west"], BBOX["south"], BBOX["east"], BBOX["north"]),
-        tags={"building": True},
+    ox.settings.max_query_area_size = MAX_QUERY_AREA_M2
+    ox.settings.requests_timeout = REQUEST_TIMEOUT_S
+
+    osm = ox.features_from_place(place, tags={"building": True})
+    osm = osm[osm.geom_type.isin(["Polygon", "MultiPolygon"])]
+
+    heights, sources = resolve_heights(osm)
+    print_height_coverage(sources)
+
+    buildings = gpd.GeoDataFrame(
+        {
+            "osm_id": [f"{element}/{osm_id}" for element, osm_id in osm.index],
+            "building_type": osm["building"].fillna("unknown").astype(str).to_numpy(),
+            "height_m": heights.round(1).to_numpy(),
+            "height_source": sources.to_numpy(),
+        },
+        geometry=osm.geometry.to_numpy(),
+        crs=osm.crs,
     )
-
-    features = []
-    stats = {"height": 0, "levels": 0, "type_fallback": 0, "default": 0}
-    for _, row in gdf.iterrows():
-        geom = row.geometry
-        if geom is None or geom.geom_type not in ("Polygon", "MultiPolygon"):
-            continue
-
-        btype = row.get("building")
-        btype = btype if isinstance(btype, str) else None
-        h, source = resolve_height(row.get("height"), row.get("building:levels"), btype)
-        stats[source] += 1
-
-        features.append({
-            "type": "Feature",
-            "properties": {
-                "height_m": round(h, 1),
-                "height_source": source,
-                "building_type": btype or "unknown",
-            },
-            "geometry": geom.__geo_interface__,
-        })
-
-    total = sum(stats.values()) or 1
-    print(f"OSM buildings in bbox: {total}")
-    for k, v in stats.items():
-        print(f"  {k:14s}: {v:5d} ({100*v/total:.1f}%)")
-
-    return {"type": "FeatureCollection", "features": features}
+    return polygons_only(buildings)
 
 
 def load_buildings(refresh=False):
-    """Cache-first accessor: read CACHE_FILE unless missing or --refresh."""
+    """Cache-first accessor: read CACHE_FILE unless it's missing or `refresh`."""
     if CACHE_FILE.exists() and not refresh:
         print(f"Using cached buildings: {CACHE_FILE}")
-        return json.loads(CACHE_FILE.read_text())
+        return gpd.read_parquet(CACHE_FILE)
 
-    fc = fetch_buildings()
+    buildings = fetch_buildings()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    CACHE_FILE.write_text(json.dumps(fc))
-    print(f"Wrote {CACHE_FILE} ({len(fc['features'])} features)")
-    return fc
+    buildings.to_parquet(CACHE_FILE)
+    print(f"Wrote {CACHE_FILE} ({len(buildings)} footprints)")
+    return buildings
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--refresh", action="store_true", help="bypass cache, re-fetch from Overpass")
+    ap.add_argument("--refresh", action="store_true", help="re-download from Overpass even if cached")
     args = ap.parse_args()
     load_buildings(refresh=args.refresh)
 

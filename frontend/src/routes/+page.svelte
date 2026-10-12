@@ -1,37 +1,36 @@
 <script lang="ts">
 	import Map from '$lib/Map.svelte';
 	import TimeControl from '$lib/TimeControl.svelte';
-	import { fetchShadows, type Shadows } from '$lib/api';
+	import { fetchSun, type Moment, type Sun } from '$lib/api';
 	import { bucharestNow, formatMinutes, snapMinutes } from '$lib/time';
 
 	const now = bucharestNow();
+	// What the controls show, updated on every slider step...
 	let date = $state(now.date);
 	let minutes = $state(snapMinutes(now.minutes));
-	// Raw: a large GeoJSON blob that is replaced, never mutated - a deep
-	// proxy would only cost time.
-	let shadows = $state.raw<Shadows | null>(null);
-	// True while the shade on the map doesn't match the chosen moment yet.
-	let loading = $state(false);
+	// ...and the moment the map shows, which follows once the slider settles.
+	let moment = $state<Moment>({ date: now.date, time: formatMinutes(snapMinutes(now.minutes)) });
+	let sun = $state<Sun | null>(null);
+	let settling = $state(false);
+	let tilesLoading = $state(false);
 	let error = $state<string | null>(null);
 
-	// Refetch whenever the moment changes. Debounced so dragging the slider
-	// doesn't fire a request per step; superseded requests are aborted.
+	// Debounced so dragging the slider doesn't request a tile set per step;
+	// a superseded sun request is aborted.
 	$effect(() => {
-		if (!date) {
-			loading = false;
-			return;
-		}
-		const [d, t] = [date, formatMinutes(minutes)];
+		if (!date) return;
+		const next = { date, time: formatMinutes(minutes) };
 		const ctrl = new AbortController();
-		loading = true;
+		settling = true;
 		const timer = setTimeout(async () => {
+			moment = next;
 			try {
-				shadows = await fetchShadows(d, t, ctrl.signal);
+				sun = await fetchSun(next, ctrl.signal);
 				error = null;
 			} catch (e) {
-				if (!ctrl.signal.aborted) error = `Could not load shadows (${(e as Error).message})`;
+				if (!ctrl.signal.aborted) error = `Could not reach the backend (${(e as Error).message})`;
 			} finally {
-				if (!ctrl.signal.aborted) loading = false;
+				if (!ctrl.signal.aborted) settling = false;
 			}
 		}, 150);
 		return () => {
@@ -41,5 +40,5 @@
 	});
 </script>
 
-<Map {shadows} />
-<TimeControl bind:date bind:minutes sun={shadows?.sun} {loading} {error} />
+<Map {moment} {sun} bind:loading={tilesLoading} />
+<TimeControl bind:date bind:minutes sun={sun ?? undefined} loading={settling || tilesLoading} {error} />
