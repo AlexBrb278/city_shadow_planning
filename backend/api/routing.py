@@ -16,6 +16,7 @@ import math
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
+import advice
 import networkx as nx
 import numpy as np
 import shapely
@@ -25,6 +26,10 @@ from edge_shade import shaded_fraction
 from tiles import HALF_WORLD, tile_bounds
 
 MAX_ALPHA = 4.0
+# A run of edges each less shaded than this is a "sunny stretch"; ones at
+# least SUNNY_STRETCH_MIN_M long are worth warning about.
+SUNNY_BELOW = 0.35
+SUNNY_STRETCH_MIN_M = 150.0
 WALKING_SPEED_M_PER_MIN = 4800 / 60  # 4.8 km/h
 # The corridor reaches this far either side of the straight line, or a
 # quarter of the trip if that's more, so reasonable detours are covered.
@@ -57,17 +62,50 @@ class Route:
             "shade_pct": round(100 * shaded / distance, 1) if distance else 0.0,
         }
 
-    def geometry(self, streets):
-        """The route as one WGS84 LineString (lon, lat)."""
-        coords = []
-        for eid, u in zip(self.edges, self.nodes):
+    def pieces(self, streets, start=0, stop=None):
+        """WGS84 coordinates of edges [start:stop], each running u -> v."""
+        for eid, u in list(zip(self.edges, self.nodes))[start:stop]:
             xy = shapely.get_coordinates(streets.lines_wgs84[eid])
-            start = (streets.graph.nodes[u]["x"], streets.graph.nodes[u]["y"])
+            origin = (streets.graph.nodes[u]["x"], streets.graph.nodes[u]["y"])
             # Make each piece run from u to v, whatever way it was stored.
-            if np.hypot(*(xy[0] - start)) > np.hypot(*(xy[-1] - start)):
+            if np.hypot(*(xy[0] - origin)) > np.hypot(*(xy[-1] - origin)):
                 xy = xy[::-1]
+            yield xy
+
+    def geometry(self, streets, start=0, stop=None):
+        """Edges [start:stop] of the route as one WGS84 LineString (lon, lat)."""
+        coords = []
+        for xy in self.pieces(streets, start, stop):
             coords.extend(xy[1:] if coords else xy)
         return shapely.LineString(coords) if len(coords) > 1 else shapely.Point(coords[0])
+
+    def sunny_stretches(self, streets, fractions):
+        """Runs of consecutive sunny edges at least SUNNY_STRETCH_MIN_M long,
+        as dicts with length_m, name (the street most of it is on) and a
+        GeoJSON geometry."""
+        sunny = fractions[self.edges] < SUNNY_BELOW
+        stretches, i = [], 0
+        while i < len(self.edges):
+            if not sunny[i]:
+                i += 1
+                continue
+            j = i
+            while j < len(self.edges) and sunny[j]:
+                j += 1
+            edges = self.edges[i:j]
+            length = float(streets.length_m[edges].sum())
+            if length >= SUNNY_STRETCH_MIN_M:
+                by_name = {}
+                for e in edges:
+                    by_name[streets.names[e]] = by_name.get(streets.names[e], 0) + streets.length_m[e]
+                name = max(by_name, key=by_name.get)
+                stretches.append({
+                    "length_m": round(length),
+                    "name": name,
+                    "geometry": shapely.geometry.mapping(self.geometry(streets, i, j)),
+                })
+            i = j
+        return stretches
 
 
 def tile_of(x, y, z):
@@ -131,12 +169,13 @@ def shortest_route(streets, source, target, cost):
     return Route(np.array(edges, dtype=int), nodes[:-1])
 
 
-def plan(streets, start_xy, end_xy, preference, fractions_for):
+def plan(streets, start_xy, end_xy, preference, fractions_for, weather=None, sun_up=True):
     """Fastest and shade-preferring routes between two Web Mercator points.
 
-    `preference` in [0, 1] scales alpha; `fractions_for(start_xy, end_xy)`
-    returns every edge's shaded fraction for the trip. Returns a dict ready
-    for JSON."""
+    `preference` in [0, 1] scales alpha, and so does the weather's sun
+    strength: under cloud shade is worth less, in rain nothing.
+    `fractions_for(start_xy, end_xy)` returns every edge's shaded fraction
+    for the trip. Returns a dict ready for JSON."""
     scale = units_per_metre((start_xy[1] + end_xy[1]) / 2)
     if np.hypot(end_xy[0] - start_xy[0], end_xy[1] - start_xy[1]) / scale > MAX_TRIP_M:
         raise RouteError(f"points are more than {MAX_TRIP_M / 1000:g} km apart")
@@ -149,7 +188,8 @@ def plan(streets, start_xy, end_xy, preference, fractions_for):
         raise RouteError("start and finish are the same place")
 
     fractions = fractions_for(start_xy, end_xy)
-    alpha = MAX_ALPHA * preference
+    strength = 1.0 if weather is None else weather.sun_strength
+    alpha = MAX_ALPHA * preference * strength
     fastest = shortest_route(streets, source, target, streets.length_m)
     shady = shortest_route(streets, source, target, streets.length_m * (1 + alpha * (1 - fractions)))
 
@@ -163,6 +203,9 @@ def plan(streets, start_xy, end_xy, preference, fractions_for):
 
     fast_f, shady_f = feature(fastest, "fastest"), feature(shady, "shady")
     fp, sp = fast_f["properties"], shady_f["properties"]
+    stretches = shady.sunny_stretches(streets, fractions) if sun_up else []
+    for props in (fp, sp):
+        props["sun_min"] = round(advice.sun_minutes(props, strength if sun_up else 0.0), 1)
     return {
         "fastest": fast_f,
         "shady": shady_f,
@@ -171,5 +214,8 @@ def plan(streets, start_xy, end_xy, preference, fractions_for):
             "duration_min": round(sp["duration_min"] - fp["duration_min"], 1),
             "shade_pct": round(sp["shade_pct"] - fp["shade_pct"], 1),
         },
-        "alpha": alpha,
+        "alpha": round(alpha, 2),
+        "weather": None if weather is None else weather.to_json(),
+        "sunny_stretches": stretches,
+        "advice": advice.advise(sp, sun_up, weather, stretches),
     }

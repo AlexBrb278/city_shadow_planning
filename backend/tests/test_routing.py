@@ -20,8 +20,10 @@ from shapely.geometry import box
 
 import main
 import routing
+import weather
 from buildings import Buildings, units_per_metre
 from streets import Streets
+from test_weather import hourly
 from tiles import tile_bounds
 
 Z, X, Y = 15, 18759, 11860
@@ -35,7 +37,7 @@ SCALE = units_per_metre(CY)
 TO_LONLAT = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 
 POINTS_M = {"A": (0, 0), "B": (0, 200), "C": (60, 0), "D": (60, 200)}
-STREETS_M = [("A", "B", 200), ("A", "C", 60), ("C", "D", 200), ("D", "B", 60)]
+STREETS_M = [("A", "B", 200, "Strada Soarelui"), ("A", "C", 60, None), ("C", "D", 200, "Strada Umbrei"), ("D", "B", 60, None)]
 
 
 def merc(x_m, y_m):
@@ -52,9 +54,10 @@ def neighbourhood():
         lon, lat = lonlat(name)
         graph.add_node(i, x=lon, y=lat, name=name)
     ids = {name: i for i, name in enumerate(POINTS_M)}
-    for a, b, length in STREETS_M:
-        graph.add_edge(ids[a], ids[b], length=float(length))
-        graph.add_edge(ids[b], ids[a], length=float(length))
+    for a, b, length, name in STREETS_M:
+        attrs = {"length": float(length), **({"name": name} if name else {})}
+        graph.add_edge(ids[a], ids[b], **attrs)
+        graph.add_edge(ids[b], ids[a], **attrs)
     return Streets(graph)
 
 
@@ -145,3 +148,56 @@ def test_corridor_covers_the_straight_line():
     for t in np.linspace(0, 1, 50):
         x, y = start[0] + t * (end[0] - start[0]), start[1] + t * (end[1] - start[1])
         assert routing.tile_of(x, y, Z) in found
+
+
+def with_weather(monkeypatch, **overrides):
+    monkeypatch.setattr(weather, "fetch_day", lambda d: hourly(**overrides))
+    weather._cache.clear()
+
+
+def test_sunny_stretch_is_named(client):
+    body = get_route(client, shade=0).json()  # the direct, sunny street
+    (stretch,) = body["sunny_stretches"]
+    assert stretch["name"] == "Strada Soarelui"
+    assert stretch["length_m"] == 200
+    assert stretch["geometry"]["type"] == "LineString"
+
+
+def test_shady_route_has_no_long_sunny_stretch(client):
+    assert get_route(client, shade=1).json()["sunny_stretches"] == []
+
+
+def test_rain_takes_the_quickest_way_and_suggests_an_umbrella(client, monkeypatch):
+    with_weather(monkeypatch, precipitation={18: 1.5}, weather_code={18: 63})
+    body = get_route(client, shade=1).json()
+    assert body["weather"]["is_raining"] is True
+    assert body["alpha"] == 0
+    assert body["shady"]["geometry"] == body["fastest"]["geometry"]
+    assert [t["id"] for t in body["advice"]] == ["umbrella"]
+
+
+def test_overcast_weakens_the_shade_preference(client, monkeypatch):
+    with_weather(monkeypatch, cloud_cover={18: 100}, weather_code={18: 3})
+    body = get_route(client, shade=1).json()
+    assert body["alpha"] == pytest.approx(routing.MAX_ALPHA * 0.1)
+    # A 60% detour isn't worth it for a sliver of sun.
+    assert body["shady"]["properties"]["distance_m"] == 200
+
+
+def test_short_hot_walk_reports_sun_minutes_but_needs_no_kit(client, monkeypatch):
+    with_weather(monkeypatch, temperature_2m={18: 34.0})
+    body = get_route(client, shade=0).json()
+    assert body["alpha"] == 0 and body["weather"]["summary"] == "Clear"
+    # 200 m in full sun is 2.5 minutes: below every threshold, even at 34°C.
+    assert body["shady"]["properties"]["sun_min"] == 2.5
+    assert body["advice"] == []
+
+
+def test_weather_endpoint(client, monkeypatch):
+    with_weather(monkeypatch, cloud_cover={13: 50})
+    body = client.get("/weather", params=NOON).json()["weather"]
+    assert body["cloud_cover_pct"] == 50 and body["sun_strength"] == 0.55
+
+
+def test_weather_endpoint_unknown(client):
+    assert client.get("/weather", params=NOON).json() == {"weather": None}

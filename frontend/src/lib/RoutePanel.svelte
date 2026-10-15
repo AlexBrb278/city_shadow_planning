@@ -8,15 +8,26 @@
 		result,
 		loading = false,
 		error = null,
-		onclear
+		startIsMe = false,
+		canUseMe = false,
+		onclear,
+		onusepin,
+		onuseme
 	}: {
+		/** The trip's start, wherever it comes from. */
 		from: LngLat | null;
 		to: LngLat | null;
 		shade: number;
 		result: RouteResult | null;
 		loading?: boolean;
 		error?: string | null;
+		/** The start is the walker's GPS position. */
+		startIsMe?: boolean;
+		/** GPS is available, so the start could be the walker's position. */
+		canUseMe?: boolean;
 		onclear: () => void;
+		onusepin?: () => void;
+		onuseme?: () => void;
 	} = $props();
 
 	const PREFERENCES = ['Fastest', 'A little', 'Some', 'Lots', 'Max shade'];
@@ -30,16 +41,26 @@
 
 <section class="panel" aria-label="Route">
 	{#if !from}
-		<p class="hint">Tap the map to set where you start</p>
+		<p class="hint">
+			Tap the map to set where you start{#if !canUseMe}, or <span class="arrow-glyph">▲</span> to
+				start from your location{/if}
+		</p>
 	{:else if !to}
-		<p class="hint">Now tap where you're going</p>
+		<p class="hint">{startIsMe ? 'From your location - tap' : 'Now tap'} where you're going</p>
 	{:else if error}
 		<p class="error" role="alert">{error}</p>
 	{:else if result}
 		{@const fast = result.fastest.properties}
 		{@const shady = result.shady.properties}
+		{@const w = result.weather}
 		<div class="card" class:stale={loading} aria-live="polite">
-			{#if !result.sun_up}
+			{#if w?.is_raining}
+				<p class="headline">{w.summary} - taking the quickest way</p>
+				<p class="detail">
+					{Math.round(fast.duration_min)} min · {(fast.distance_m / 1000).toFixed(1)} km · shade won't keep
+					you dry
+				</p>
+			{:else if !result.sun_up}
 				<p class="headline">Sun's down — every street is in shade</p>
 				<p class="detail">{Math.round(fast.duration_min)} min · {(fast.distance_m / 1000).toFixed(1)} km</p>
 			{:else if result.delta.distance_m === 0 && shady.shade_pct === fast.shade_pct}
@@ -59,6 +80,12 @@
 					({(shady.distance_m / 1000).toFixed(1)} km)
 				</p>
 			{/if}
+			{#if w && !w.is_raining && result.sun_up && w.sun_strength < 0.5}
+				<p class="detail">{w.summary} ({Math.round(w.cloud_cover_pct)}% cloud) - shade counts for less today</p>
+			{/if}
+			{#if result.sunny_stretches.length && result.sun_up && !w?.is_raining}
+				<p class="detail"><span class="swatch sun"></span>Long sunny stretches</p>
+			{/if}
 		</div>
 	{:else}
 		<p class="hint">Finding routes…</p>
@@ -75,10 +102,15 @@
 			bind:value={shade}
 			aria-valuetext={label}
 		/>
-		{#if from}
+		{#if to || (from && !startIsMe)}
 			<button type="button" onclick={onclear}>Clear</button>
 		{/if}
 	</div>
+	{#if startIsMe}
+		<button type="button" class="link" onclick={onusepin}>Start somewhere else instead</button>
+	{:else if canUseMe}
+		<button type="button" class="link" onclick={onuseme}>Start from my location</button>
+	{/if}
 </section>
 
 <style>
@@ -133,6 +165,21 @@
 	.swatch.shady {
 		background: var(--route-shady);
 		height: 6px;
+	}
+	.swatch.sun {
+		background: var(--route-sun);
+		height: 6px;
+	}
+	.arrow-glyph {
+		color: var(--me);
+	}
+	button.link {
+		justify-self: start;
+		padding: 0;
+		border: none;
+		color: var(--me);
+		text-decoration: underline;
+		font-size: 13px;
 	}
 	.swatch.fast {
 		background: repeating-linear-gradient(90deg, var(--route-fast) 0 4px, transparent 4px 7px);

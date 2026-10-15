@@ -24,6 +24,7 @@ import tiles
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pipeline"))
 import routing  # noqa: E402  (uses pipeline modules)
+import weather  # noqa: E402
 from buildings import WEB_MERCATOR, Buildings  # noqa: E402
 from edge_shade import shaded_lengths_in_tile  # noqa: E402
 from shadows import shade_near  # noqa: E402
@@ -119,6 +120,14 @@ def sun(date: str = DATE, time: str = TIME):
     }
 
 
+@app.get("/weather")
+def weather_now(date: str = DATE, time: str = TIME):
+    """Bucharest weather at a local moment (nearest hour), with sun_strength:
+    how much direct sun gets through, 0..1. `weather` is null if unknown."""
+    conditions = weather.weather_at(moment(date, time))
+    return {"weather": None if conditions is None else conditions.to_json()}
+
+
 @app.get("/tiles/buildings/{z}/{x}/{y}.pbf")
 def building_tile(z: int, x: int, y: int):
     """Building footprints with height_m and height_source, for 3D extrusion."""
@@ -197,8 +206,9 @@ def route(
             streets(), corridor, lambda x, y: edge_shade_tile(TILE_ZOOM, x, y, date, time)
         )
 
+    conditions = weather.weather_at(when)
     try:
-        result = routing.plan(streets(), start, end, shade, fractions_for)
+        result = routing.plan(streets(), start, end, shade, fractions_for, conditions, sun_up)
     except routing.RouteError as e:
         raise HTTPException(status_code=422, detail=str(e))
     return {"time": when.isoformat(), "sun_up": sun_up, **result}

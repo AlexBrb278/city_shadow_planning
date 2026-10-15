@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { Sun } from '$lib/api';
+	import type { Sun, Weather } from '$lib/api';
 	import {
 		SLIDER_MAX,
 		SLIDER_MIN,
@@ -14,15 +14,24 @@
 		date = $bindable(),
 		minutes = $bindable(),
 		sun,
+		weather = null,
 		loading = false,
 		error = null
 	}: {
 		date: string;
 		minutes: number;
 		sun?: Sun;
+		weather?: Weather | null;
 		loading?: boolean;
 		error?: string | null;
 	} = $props();
+
+	function weatherIcon(w: Weather): string {
+		if (w.is_raining) return '🌧';
+		if (w.cloud_cover_pct >= 80) return '☁️';
+		if (w.cloud_cover_pct >= 30) return '⛅';
+		return sun?.is_up ? '☀️' : '🌙';
+	}
 
 	function jumpToNow() {
 		const now = bucharestNow();
@@ -57,6 +66,16 @@
 			Sun below the horizon - no shadows to show
 		{/if}
 	</p>
+	{#if weather && !error}
+		<p class="weather" class:wet={weather.is_raining}>
+			{weatherIcon(weather)}
+			{weather.summary}
+			{#if weather.temperature_c !== null}· {Math.round(weather.temperature_c)}°C{/if}
+			· {Math.round(weather.cloud_cover_pct)}% cloud
+			{#if weather.precipitation_mm > 0}· {weather.precipitation_mm.toFixed(1)} mm rain{/if}
+			{#if weather.uv_index !== null && weather.uv_index >= 3}· UV {Math.round(weather.uv_index)}{/if}
+		</p>
+	{/if}
 </div>
 
 <style>
@@ -111,6 +130,14 @@
 	.status {
 		margin: 0;
 		color: var(--panel-muted);
+	}
+	.weather {
+		margin: 0;
+		color: var(--panel-muted);
+	}
+	.weather.wet {
+		color: var(--me);
+		font-weight: 600;
 	}
 	.status.error {
 		color: var(--error);

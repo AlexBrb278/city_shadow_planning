@@ -22,3 +22,14 @@ def same_shape(a, b, tolerance=1e-6):
 @pytest.fixture
 def south_45():
     return SOUTH_45
+
+
+@pytest.fixture(autouse=True)
+def no_weather_service(monkeypatch):
+    """Tests never call Open-Meteo: weather is unknown unless a test says otherwise."""
+    import weather
+
+    monkeypatch.setattr(weather, "fetch_day", lambda date_str: None)
+    weather._cache.clear()
+    yield
+    weather._cache.clear()

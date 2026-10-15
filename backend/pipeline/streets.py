@@ -41,6 +41,7 @@ class Streets:
         self.edge_keys = edges.index.to_numpy()  # (u, v, key) tuples
         self.lines = edges.geometry.to_numpy()
         self.length_m = edges["length"].to_numpy(dtype=float)
+        self.names = np.array([street_name(n) for n in edges.get("name", [None] * len(edges))], dtype=object)
         for eid, (u, v, k) in enumerate(self.edge_keys):
             graph.edges[u, v, k]["eid"] = eid
 
@@ -69,3 +70,11 @@ class Streets:
         d2 = (self.node_xy[:, 0] - x) ** 2 + (self.node_xy[:, 1] - y) ** 2
         i = int(np.argmin(d2))
         return self.node_ids[i], float(np.sqrt(d2[i]))
+
+
+def street_name(raw):
+    """OSM name of an edge as one string, or None. Simplified edges that
+    merge several ways carry a list of names; the first is kept."""
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    return raw if isinstance(raw, str) and raw else None

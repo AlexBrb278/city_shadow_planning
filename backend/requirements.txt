@@ -8,8 +8,8 @@ numpy
 pyproj
 pysolar
 mapbox-vector-tile>=2.0
+httpx                  # weather from Open-Meteo (also fastapi.testclient)
 tzdata                 # zoneinfo has no timezone database of its own on Windows
 
 # tests
 pytest
-httpx                  # fastapi.testclient

@@ -41,6 +41,33 @@ export interface RouteStats {
 	duration_min: number;
 	/** Length-weighted share of the route in shade, 0-100. */
 	shade_pct: number;
+	/** Minutes in direct sun, discounted for cloud. */
+	sun_min: number;
+}
+
+export interface Weather {
+	temperature_c: number | null;
+	precipitation_mm: number;
+	precipitation_probability_pct: number | null;
+	cloud_cover_pct: number;
+	uv_index: number | null;
+	weather_code: number | null;
+	summary: string;
+	is_raining: boolean;
+	/** How much direct sun reaches the street, 0..1. */
+	sun_strength: number;
+}
+
+export interface Advice {
+	id: 'water' | 'hat' | 'sunscreen' | 'umbrella';
+	title: string;
+	text: string;
+}
+
+export interface SunnyStretch {
+	length_m: number;
+	name: string | null;
+	geometry: LineString;
 }
 
 export interface RouteResult {
@@ -50,6 +77,19 @@ export interface RouteResult {
 	shady: Feature<LineString, RouteStats>;
 	/** shady minus fastest */
 	delta: { distance_m: number; duration_min: number; shade_pct: number };
+	/** The shade preference after weather: 0 when it rains. */
+	alpha: number;
+	weather: Weather | null;
+	/** Long sunny runs on the shady route. */
+	sunny_stretches: SunnyStretch[];
+	advice: Advice[];
+}
+
+/** Weather at a moment, or null if Open-Meteo doesn't know it. */
+export async function fetchWeather({ date, time }: Moment, signal?: AbortSignal): Promise<Weather | null> {
+	const res = await fetch(`${API_BASE}/weather?${new URLSearchParams({ date, time })}`, { signal });
+	if (!res.ok) throw new Error(`/weather -> HTTP ${res.status}`);
+	return (await res.json()).weather;
 }
 
 /** Fastest and shade-preferring walks between two points; `shade` in [0, 1]. */

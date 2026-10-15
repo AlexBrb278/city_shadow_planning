@@ -37,6 +37,17 @@ OpenStreetMap ──fetch_osm.py──▶ buildings.parquet ──▶ API (tiles
    α = 0 is the shortest route; at α = 4 a sunny metre costs as much as five
    shady ones. Every request returns both the shortest and the preferred
    route, so the app can show what the shade costs: *"+1 min, 98% shade vs 81%"*.
+5. **Weather** comes from [Open-Meteo](https://open-meteo.com) (free, no key;
+   forecast API for ~3 months back to 16 days ahead, archive API before
+   that). It is boiled down to a *sun strength*: `1 − 0.9 × cloud cover`,
+   or 0 when it rains. That multiplies α, so under overcast a detour for
+   shade is rarely worth it, and in rain you get the quickest way. If the
+   service is unreachable, routing carries on as if it were sunny.
+6. **Advice.** *Sun minutes* = walking minutes outside shade × sun strength.
+   From 8 the app suggests covering your head, from 15 (or 5 above 27 °C)
+   bringing water, sunscreen at UV ≥ 6, and an umbrella when it rains. It
+   names the longest sunny stretch (≥ 150 m of edges under 35% shade), which
+   is also drawn in orange on the route.
 
 ### Backend layout
 
@@ -51,6 +62,8 @@ OpenStreetMap ──fetch_osm.py──▶ buildings.parquet ──▶ API (tiles
 | `pipeline/edge_shade.py`     | shaded fraction of each street edge, per tile             |
 | `api/tiles.py`               | tile coordinates and vector-tile encoding                 |
 | `api/routing.py`             | corridor, edge cost, A*, fastest vs shady comparison      |
+| `api/weather.py`             | Open-Meteo lookup, cache, rain / sun strength             |
+| `api/advice.py`              | water / hat / sunscreen / umbrella tips                   |
 | `api/main.py`                | HTTP endpoints                                            |
 
 ### API
@@ -60,7 +73,8 @@ OpenStreetMap ──fetch_osm.py──▶ buildings.parquet ──▶ API (tiles
 | `/sun?date=YYYY-MM-DD&time=HH:MM`               | sun elevation/azimuth, Bucharest time     |
 | `/tiles/buildings/15/{x}/{y}.pbf`               | footprints with `height_m`, `height_source` |
 | `/tiles/shade/15/{x}/{y}.pbf?date=…&time=…`     | shade polygons (empty while sun is down)  |
-| `/route?from_lat&from_lon&to_lat&to_lon&date&time&shade=0..1` | fastest + shady routes (GeoJSON) with `distance_m`, `duration_min` (4.8 km/h), `shade_pct`, and their `delta` |
+| `/route?from_lat&from_lon&to_lat&to_lon&date&time&shade=0..1` | fastest + shady routes (GeoJSON) with `distance_m`, `duration_min` (4.8 km/h), `shade_pct`, `sun_min`, their `delta`, plus `weather`, `alpha`, `sunny_stretches` and `advice` |
+| `/weather?date=YYYY-MM-DD&time=HH:MM`           | temperature, cloud, rain, UV, `sun_strength` (null if unknown) |
 
 `/route` answers 422 when the points are more than 7 km apart, more than
 250 m from any walkable street, or the same place. At night every street
@@ -134,9 +148,26 @@ npm --prefix frontend install
 npm --prefix frontend run dev -- --port 5173
 ```
 
-Open http://localhost:5173. Tap the map once for the start and again for
-the destination (drag the pins to adjust); the shade slider sets how much a
-detour is worth.
+Open http://localhost:5173.
+
+- **Your location:** the arrow button (right side) starts GPS and locks the
+  camera behind you, looking the way you face (compass when the phone has
+  one, GPS course while walking). Your position shows as a triangle pointing
+  that way and becomes the route's start; then a tap sets the destination.
+  Dragging or turning the map releases the lock; the arrow button re-locks.
+- **Without GPS:** tap once for the start and again for the destination
+  (drag the pins to adjust).
+- **Camera:** rotate with the ↺ / ↻ buttons, two fingers on a phone, or
+  right-drag / Ctrl-drag on desktop; the compass button turns north up.
+- **Basemap:** satellite by default; the layers button switches to the
+  street map (remembered per device).
+- The shade slider sets how much a detour is worth; weather scales it.
+
+Satellite imagery is Esri World Imagery, free for development and
+non-commercial use with attribution. A published app needs an ArcGIS
+account (or another imagery provider such as MapTiler or Mapbox). Geolocation
+needs a secure context (`localhost` or HTTPS) and, on iOS, a tap to allow
+the compass.
 
 ```bash
 # backend tests (no network or downloaded data needed)
