@@ -1,84 +1,46 @@
-import sys
-from pathlib import Path
+import numpy as np
+import pandas as pd
+import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pipeline"))
-
-from heights import resolve_height, DEFAULT_HEIGHT_M, TYPE_HEIGHT_M, METERS_PER_LEVEL
-
-
-def test_explicit_height_tag_wins():
-    h, source = resolve_height("21", "5", "apartments")
-    assert h == 21.0
-    assert source == "height"
+from heights import DEFAULT_HEIGHT_M, METERS_PER_LEVEL, TYPE_HEIGHT_M, resolve_heights
 
 
-def test_height_tag_with_unit_suffix():
-    h, source = resolve_height("12 m", None, None)
-    assert h == 12.0
-    assert source == "height"
+def resolve_one(height=np.nan, levels=np.nan, building=np.nan):
+    tags = pd.DataFrame({"height": [height], "building:levels": [levels], "building": [building]})
+    heights, sources = resolve_heights(tags)
+    return heights.iloc[0], sources.iloc[0]
 
 
-def test_height_tag_with_approx_prefix():
-    h, source = resolve_height("~4", None, None)
-    assert h == 4.0
-    assert source == "height"
+@pytest.mark.parametrize(
+    "height, levels, building, expected",
+    [
+        # explicit height tag, in its many spellings
+        ("21", "5", "apartments", (21.0, "height")),
+        ("12 m", np.nan, np.nan, (12.0, "height")),
+        ("12m", np.nan, np.nan, (12.0, "height")),
+        ("~4", np.nan, np.nan, (4.0, "height")),
+        ("12;14", np.nan, np.nan, (12.0, "height")),
+        # levels
+        ("not-a-number", "3", np.nan, (3 * METERS_PER_LEVEL, "levels")),
+        (np.nan, "4", "residential", (4 * METERS_PER_LEVEL, "levels")),
+        (np.nan, "2.5", np.nan, (2.5 * METERS_PER_LEVEL, "levels")),
+        (np.nan, "3;4", "house", (3 * METERS_PER_LEVEL, "levels")),
+        # type fallback
+        (np.nan, "two", "church", (TYPE_HEIGHT_M["church"], "type_fallback")),
+        ("0", "0", "house", (TYPE_HEIGHT_M["house"], "type_fallback")),
+        (np.nan, np.nan, "commercial", (TYPE_HEIGHT_M["commercial"], "type_fallback")),
+        ("nan", "nan", "retail", (TYPE_HEIGHT_M["retail"], "type_fallback")),
+        # default
+        (np.nan, np.nan, np.nan, (DEFAULT_HEIGHT_M, "default")),
+        (np.nan, np.nan, "parking", (DEFAULT_HEIGHT_M, "default")),
+        ("12 ft", np.nan, "yes", (DEFAULT_HEIGHT_M, "default")),
+    ],
+)
+def test_height_ladder(height, levels, building, expected):
+    assert resolve_one(height, levels, building) == expected
 
 
-def test_height_tag_multi_value_takes_first():
-    h, source = resolve_height("12;14", None, None)
-    assert h == 12.0
-    assert source == "height"
-
-
-def test_malformed_height_falls_back_to_levels():
-    h, source = resolve_height("not-a-number", "3", None)
-    assert h == 3 * METERS_PER_LEVEL
-    assert source == "levels"
-
-
-def test_levels_tag_used_when_no_height():
-    h, source = resolve_height(None, "4", "residential")
-    assert h == 4 * METERS_PER_LEVEL
-    assert source == "levels"
-
-
-def test_fractional_levels():
-    h, source = resolve_height(None, "2.5", None)
-    assert h == 2.5 * METERS_PER_LEVEL
-    assert source == "levels"
-
-
-def test_malformed_levels_falls_back_to_type():
-    h, source = resolve_height(None, "two", "church")
-    assert h == TYPE_HEIGHT_M["church"]
-    assert source == "type_fallback"
-
-
-def test_zero_height_falls_through_ladder():
-    h, source = resolve_height("0", "0", "house")
-    assert h == TYPE_HEIGHT_M["house"]
-    assert source == "type_fallback"
-
-
-def test_type_fallback_for_known_type():
-    h, source = resolve_height(None, None, "commercial")
-    assert h == TYPE_HEIGHT_M["commercial"]
-    assert source == "type_fallback"
-
-
-def test_default_when_nothing_resolves():
-    h, source = resolve_height(None, None, None)
-    assert h == DEFAULT_HEIGHT_M
-    assert source == "default"
-
-
-def test_default_for_unknown_type():
-    h, source = resolve_height(None, None, "parking")
-    assert h == DEFAULT_HEIGHT_M
-    assert source == "default"
-
-
-def test_nan_string_treated_as_missing():
-    h, source = resolve_height("nan", "nan", "retail")
-    assert h == TYPE_HEIGHT_M["retail"]
-    assert source == "type_fallback"
+def test_resolve_heights_without_height_columns():
+    heights, sources = resolve_heights(pd.DataFrame({"building": ["yes"]}))
+    assert list(heights) == [DEFAULT_HEIGHT_M]
+    assert list(sources) == ["default"]

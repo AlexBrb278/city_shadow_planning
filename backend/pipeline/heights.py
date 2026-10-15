@@ -1,15 +1,16 @@
-#!/usr/bin/env python3
 """
-Height resolution ladder for OSM building footprints, shared by the fetch
-pipeline and its tests: explicit height tag -> building:levels * 3.0m ->
-fallback by building type -> default 8m.
+Height resolution ladder for OSM building footprints: explicit height tag ->
+building:levels x 3 m -> typical height for the building type -> 8 m.
+
+Vectorised over a whole city's tags at once (a pandas DataFrame with OSM tag
+columns, as osmnx returns them).
 """
 
-import geopandas as gpd
+import numpy as np
+import pandas as pd
 
 METERS_PER_LEVEL = 3.0
-
-# Fallback height by building type when neither height nor levels tag exists.
+# Typical height by building type, for buildings with no height or levels tag.
 TYPE_HEIGHT_M = {
     "apartments": 10 * METERS_PER_LEVEL,
     "residential": 2 * METERS_PER_LEVEL,
@@ -20,64 +21,46 @@ TYPE_HEIGHT_M = {
 }
 DEFAULT_HEIGHT_M = 8.0
 
-
-def _parse_float(raw):
-    """Best-effort float parse for messy OSM tag values ('12 m', '~4',
-    '2.5', '12;14'). Returns None if nothing usable is found."""
-    if raw is None:
-        return None
-    s = str(raw).strip()
-    if s == "" or s.lower() == "nan":
-        return None
-    s = s.split(";")[0]  # some tags carry multiple values, e.g. "12;14"
-    s = s.replace("m", "").replace("~", "").strip()
-    try:
-        return float(s)
-    except ValueError:
-        return None
+SOURCES = ["height", "levels", "type_fallback", "default"]
 
 
-def resolve_height(raw_height, raw_levels, building_type):
-    """Returns (height_m, source); source is one of 'height', 'levels',
-    'type_fallback', 'default'."""
-    h = _parse_float(raw_height)
-    if h is not None and h > 0:
-        return h, "height"
-
-    levels = _parse_float(raw_levels)
-    if levels is not None and levels > 0:
-        return levels * METERS_PER_LEVEL, "levels"
-
-    if building_type in TYPE_HEIGHT_M:
-        return TYPE_HEIGHT_M[building_type], "type_fallback"
-
-    return DEFAULT_HEIGHT_M, "default"
-
-
-def build_buildings_parquet(gdf, out_path):
-    """Resolve heights for every row of a WGS84 buildings GeoDataFrame (as
-    returned by osmnx.features_from_bbox) and write geometry (UTM 32635) +
-    height_m + height_source to a GeoParquet file. Returns per-source counts."""
-    utm_geom = gdf.to_crs(epsg=32635).geometry.values
-
-    heights, sources = [], []
-    for _, row in gdf.iterrows():
-        btype = row.get("building")
-        btype = btype if isinstance(btype, str) else None
-        h, source = resolve_height(row.get("height"), row.get("building:levels"), btype)
-        heights.append(round(h, 1))
-        sources.append(source)
-
-    out = gpd.GeoDataFrame(
-        {"height_m": heights, "height_source": sources},
-        geometry=utm_geom,
-        crs="EPSG:32635",
+def positive_number(values):
+    """Parse messy OSM tag values to floats: '12', '12 m', '12m', '~4', '2.5',
+    and multi-valued '12;14' (first value wins). Anything else ('12 ft',
+    'two') or not above zero becomes NaN."""
+    cleaned = (
+        values.astype("string")
+        .str.split(";").str[0]
+        .str.strip()
+        .str.removeprefix("~")
+        .str.removesuffix("m")
+        .str.strip()
     )
-    out = out[out.geometry.notnull() & out.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
-    out.to_parquet(out_path)
+    numbers = pd.to_numeric(cleaned, errors="coerce")
+    return numbers.where(numbers > 0)
 
-    counts = out["height_source"].value_counts().to_dict()
-    print(f"buildings.parquet: {len(out)} features -> {out_path}")
-    for k, v in counts.items():
-        print(f"  {k:14s}: {v:5d} ({100*v/len(out):.1f}%)")
-    return counts
+
+def resolve_heights(tags):
+    """Height in metres for each row of OSM `tags`, and where it came from.
+    Returns (heights, sources), both Series aligned with `tags`."""
+    missing = pd.Series(np.nan, index=tags.index)
+    explicit = positive_number(tags.get("height", missing))
+    from_levels = positive_number(tags.get("building:levels", missing)) * METERS_PER_LEVEL
+    by_type = tags.get("building", missing).map(TYPE_HEIGHT_M)
+
+    heights = explicit.fillna(from_levels).fillna(by_type).fillna(DEFAULT_HEIGHT_M)
+    sources = np.select(
+        [explicit.notna(), from_levels.notna(), by_type.notna()],
+        SOURCES[:3],
+        default=SOURCES[3],
+    )
+    return heights.astype(float), pd.Series(sources, index=tags.index)
+
+
+def print_height_coverage(sources):
+    counts = sources.value_counts()
+    total = len(sources) or 1
+    print(f"OSM buildings: {len(sources)}")
+    for source in SOURCES:
+        n = counts.get(source, 0)
+        print(f"  {source:14s}: {n:7d} ({100 * n / total:.1f}%)")

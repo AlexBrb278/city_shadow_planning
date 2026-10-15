@@ -1,21 +1,58 @@
 #!/usr/bin/env python3
-"""Umbra API - serves precomputed/cached data to the frontend.
+"""Umbra API - serves Bucharest's buildings and their shade as map tiles.
+
+Buildings load once, at startup (see fetch_osm.py for the cache). Tiles are
+built on demand and kept in memory, so each one is computed once.
 
 Run: uvicorn main:app --reload --app-dir backend/api
 """
 
 import sys
+from contextlib import asynccontextmanager
+from functools import cache, lru_cache
 from pathlib import Path
 
-from fastapi import FastAPI
+import shapely
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.middleware.gzip import GZipMiddleware
+
+import tiles
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pipeline"))
-from fetch_osm import BBOX, load_buildings  # noqa: E402
+from buildings import Buildings  # noqa: E402
+from shadows import shade_near  # noqa: E402
+from sun import local_datetime, sun_at  # noqa: E402
 
-app = FastAPI(title="Umbra API")
+# Buildings and shade are served as zoom-15 tiles (~870 m across in
+# Bucharest); MapLibre stretches them for closer zooms. Keep in sync with
+# TILE_ZOOM in frontend/src/lib/api.ts.
+TILE_ZOOM = 15
+TILE_MEDIA_TYPE = "application/vnd.mapbox-vector-tile"
+# A tile's content only changes when the building data is refreshed. Being
+# cacheable also lets the browser merge MapLibre's duplicate requests: it
+# asks for a tile once per zoom level it stretches it to.
+TILE_CACHE_HEADERS = {"Cache-Control": "public, max-age=86400"}
 
+DATE = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$", description="YYYY-MM-DD, Bucharest")
+TIME = Query(..., pattern=r"^\d{2}:\d{2}$", description="HH:MM, Bucharest local time")
+
+
+@cache
+def city():
+    return Buildings.load()
+
+
+@asynccontextmanager
+async def lifespan(app):
+    # Load before serving: MapLibre asks for a dozen tiles at once, and each
+    # would otherwise start loading the whole city in parallel.
+    city()
+    yield
+
+
+app = FastAPI(title="Umbra API", lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
@@ -23,7 +60,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_buildings_cache = None
+
+def moment(date, time):
+    """The query's date and time as a Bucharest datetime, or a 422."""
+    try:
+        return local_datetime(date, time)
+    except ValueError as e:  # well-formed but not a real moment, e.g. 2026-02-30
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+def check_tile(z, x, y):
+    if z != TILE_ZOOM:
+        raise HTTPException(status_code=404, detail=f"tiles exist at zoom {TILE_ZOOM} only")
+    if not (0 <= x < 2**z and 0 <= y < 2**z):
+        raise HTTPException(status_code=404, detail="no such tile")
+
+
+def tile_response(content):
+    if not content:
+        return Response(status_code=204)  # MapLibre reads this as an empty tile
+    return Response(content, media_type=TILE_MEDIA_TYPE, headers=TILE_CACHE_HEADERS)
 
 
 @app.get("/health")
@@ -31,14 +87,55 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/bbox")
-def bbox():
-    return BBOX
+@app.get("/sun")
+def sun(date: str = DATE, time: str = TIME):
+    """Sun position over Bucharest at a local moment."""
+    when = moment(date, time)
+    position = sun_at(when)
+    return {
+        "time": when.isoformat(),
+        "elevation_deg": round(position.elevation_deg, 2),
+        "azimuth_deg": round(position.azimuth_deg, 2),
+        "is_up": position.is_up,
+    }
 
 
-@app.get("/buildings")
-def buildings():
-    global _buildings_cache
-    if _buildings_cache is None:
-        _buildings_cache = load_buildings()
-    return JSONResponse(_buildings_cache)
+@app.get("/tiles/buildings/{z}/{x}/{y}.pbf")
+def building_tile(z: int, x: int, y: int):
+    """Building footprints with height_m and height_source, for 3D extrusion."""
+    check_tile(z, x, y)
+    return tile_response(building_tile_bytes(z, x, y))
+
+
+@app.get("/tiles/shade/{z}/{x}/{y}.pbf")
+def shade_tile(z: int, x: int, y: int, date: str = DATE, time: str = TIME):
+    """Ground shade at a local Bucharest moment; empty while the sun is down."""
+    check_tile(z, x, y)
+    moment(date, time)  # reject impossible moments before touching the cache
+    return tile_response(shade_tile_bytes(z, x, y, date, time))
+
+
+@lru_cache(maxsize=1024)
+def building_tile_bytes(z, x, y):
+    bounds = tiles.tile_bounds(z, x, y)
+    area = tiles.buffered(bounds)
+    buildings = city()
+    found = buildings.within(area)
+    if len(found) == 0:
+        return b""
+    properties = [
+        {"height_m": float(height), "height_source": str(source)}
+        for height, source in zip(buildings.heights_m[found], buildings.height_sources[found])
+    ]
+    footprints = shapely.clip_by_rect(buildings.footprints[found], *area)
+    return tiles.encode("buildings", footprints, bounds, properties)
+
+
+@lru_cache(maxsize=4096)
+def shade_tile_bytes(z, x, y, date, time):
+    bounds = tiles.tile_bounds(z, x, y)
+    position = sun_at(local_datetime(date, time))
+    shade = shade_near(city(), position, tiles.buffered(bounds))
+    if shade.is_empty:
+        return b""
+    return tiles.encode("shade", shapely.get_parts(shade), bounds)

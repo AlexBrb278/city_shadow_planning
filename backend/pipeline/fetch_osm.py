@@ -1,121 +1,110 @@
 #!/usr/bin/env python3
 """
-Fetch OSM building footprints + heights and the walking street network for
-the Umbra bbox. Caches everything to backend/data/ so Overpass is never hit
-twice for the same bbox.
+Download every building in Bucharest from OpenStreetMap, give each one a
+height, and cache the result as GeoParquet for the API. Also downloads and
+caches the walking street network, which routing runs on.
 
 Usage:
-  python fetch_osm.py            # use cached files if present
-  python fetch_osm.py --refresh  # re-fetch from Overpass even if cached
+  python fetch_osm.py            # use the cached files if present
+  python fetch_osm.py --refresh  # re-download (a city-sized download takes several minutes)
 """
 
 import argparse
-import json
 from pathlib import Path
 
-from heights import resolve_height, build_buildings_parquet
+import geopandas as gpd
 
-BBOX = dict(north=44.4340, south=44.4280, east=26.1060, west=26.0960)
+from heights import print_height_coverage, resolve_heights
 
-PIPELINE_DIR = Path(__file__).resolve().parent
+# Nominatim resolves this to the municipality boundary (sectors 1-6).
+PLACE = "Bucharest, Romania"
+
+# Overpass times out on one city-sized query, so osmnx splits the area into
+# sub-queries no larger than this (5 km x 5 km) and merges the results.
+MAX_QUERY_AREA_M2 = 25_000_000
+REQUEST_TIMEOUT_S = 300
+
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
-BUILDINGS_GEOJSON = DATA_DIR / "buildings.geojson"
-BUILDINGS_PARQUET = DATA_DIR / "buildings.parquet"
-STREET_NETWORK_GRAPHML = DATA_DIR / "street_network.graphml"
+CACHE_FILE = DATA_DIR / "buildings.parquet"
+STREETS_FILE = DATA_DIR / "streets.graphml"
 
 
-def _fetch_buildings_gdf():
+def _configure_osmnx():
     import osmnx as ox
 
-    ox.settings.cache_folder = str(PIPELINE_DIR / "cache")
-    return ox.features_from_bbox(
-        bbox=(BBOX["west"], BBOX["south"], BBOX["east"], BBOX["north"]),
-        tags={"building": True},
+    ox.settings.max_query_area_size = MAX_QUERY_AREA_M2
+    ox.settings.requests_timeout = REQUEST_TIMEOUT_S
+    return ox
+
+
+def polygons_only(gdf):
+    """Repair invalid footprints and split multipolygons, leaving one plain
+    Polygon per row (each part keeps its building's attributes)."""
+    gdf = gdf.set_geometry(gdf.make_valid())
+    # make_valid can return a collection that itself holds a MultiPolygon,
+    # so explode twice to be sure only single parts remain.
+    gdf = gdf.explode(index_parts=False).explode(index_parts=False)
+    return gdf[gdf.geom_type == "Polygon"].reset_index(drop=True)
+
+
+def fetch_buildings(place=PLACE):
+    """Download the buildings of `place` from Overpass. Returns a
+    GeoDataFrame (WGS84) with height_m, height_source, building_type, osm_id."""
+    ox = _configure_osmnx()
+
+    osm = ox.features_from_place(place, tags={"building": True})
+    osm = osm[osm.geom_type.isin(["Polygon", "MultiPolygon"])]
+
+    heights, sources = resolve_heights(osm)
+    print_height_coverage(sources)
+
+    buildings = gpd.GeoDataFrame(
+        {
+            "osm_id": [f"{element}/{osm_id}" for element, osm_id in osm.index],
+            "building_type": osm["building"].fillna("unknown").astype(str).to_numpy(),
+            "height_m": heights.round(1).to_numpy(),
+            "height_source": sources.to_numpy(),
+        },
+        geometry=osm.geometry.to_numpy(),
+        crs=osm.crs,
     )
-
-
-def _buildings_gdf_to_geojson(gdf):
-    """WGS84 GeoJSON FeatureCollection for the frontend's 3D building layer."""
-    features = []
-    stats = {"height": 0, "levels": 0, "type_fallback": 0, "default": 0}
-    for _, row in gdf.iterrows():
-        geom = row.geometry
-        if geom is None or geom.geom_type not in ("Polygon", "MultiPolygon"):
-            continue
-
-        btype = row.get("building")
-        btype = btype if isinstance(btype, str) else None
-        h, source = resolve_height(row.get("height"), row.get("building:levels"), btype)
-        stats[source] += 1
-
-        features.append({
-            "type": "Feature",
-            "properties": {
-                "height_m": round(h, 1),
-                "height_source": source,
-                "building_type": btype or "unknown",
-            },
-            "geometry": geom.__geo_interface__,
-        })
-
-    total = sum(stats.values()) or 1
-    print(f"OSM buildings in bbox: {total}")
-    for k, v in stats.items():
-        print(f"  {k:14s}: {v:5d} ({100*v/total:.1f}%)")
-
-    return {"type": "FeatureCollection", "features": features}
-
-
-def fetch_buildings():
-    """Fetch buildings once from Overpass and write both artifacts:
-    buildings.geojson (WGS84, for the frontend) and buildings.parquet
-    (UTM 32635, for the shadow/routing pipeline)."""
-    gdf = _fetch_buildings_gdf()
-    fc = _buildings_gdf_to_geojson(gdf)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    build_buildings_parquet(gdf, BUILDINGS_PARQUET)
-    return fc
-
-
-def fetch_street_network(refresh=False):
-    """Fetch (or load cached) walking street network graph for the bbox."""
-    import osmnx as ox
-
-    ox.settings.cache_folder = str(PIPELINE_DIR / "cache")
-    if STREET_NETWORK_GRAPHML.exists() and not refresh:
-        print(f"Using cached street network: {STREET_NETWORK_GRAPHML}")
-        return ox.load_graphml(STREET_NETWORK_GRAPHML)
-
-    g = ox.graph_from_bbox(
-        bbox=(BBOX["west"], BBOX["south"], BBOX["east"], BBOX["north"]),
-        network_type="walk",
-    )
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    ox.save_graphml(g, STREET_NETWORK_GRAPHML)
-    print(f"Wrote {STREET_NETWORK_GRAPHML} ({len(g.nodes)} nodes, {len(g.edges)} edges)")
-    return g
+    return polygons_only(buildings)
 
 
 def load_buildings(refresh=False):
-    """Cache-first accessor for the frontend: read buildings.geojson unless
-    missing, buildings.parquet missing, or --refresh."""
-    if BUILDINGS_GEOJSON.exists() and BUILDINGS_PARQUET.exists() and not refresh:
-        print(f"Using cached buildings: {BUILDINGS_GEOJSON}")
-        return json.loads(BUILDINGS_GEOJSON.read_text())
+    """Cache-first accessor: read CACHE_FILE unless it's missing or `refresh`."""
+    if CACHE_FILE.exists() and not refresh:
+        print(f"Using cached buildings: {CACHE_FILE}")
+        return gpd.read_parquet(CACHE_FILE)
 
-    fc = fetch_buildings()
+    buildings = fetch_buildings()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    BUILDINGS_GEOJSON.write_text(json.dumps(fc))
-    print(f"Wrote {BUILDINGS_GEOJSON} ({len(fc['features'])} features)")
-    return fc
+    buildings.to_parquet(CACHE_FILE)
+    print(f"Wrote {CACHE_FILE} ({len(buildings)} footprints)")
+    return buildings
+
+
+def load_streets(refresh=False, place=PLACE):
+    """Cache-first accessor for the walking network (an osmnx MultiDiGraph in
+    WGS84, edge lengths in metres)."""
+    ox = _configure_osmnx()
+    if STREETS_FILE.exists() and not refresh:
+        print(f"Using cached streets: {STREETS_FILE}")
+        return ox.load_graphml(STREETS_FILE)
+
+    graph = ox.graph_from_place(place, network_type="walk")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ox.save_graphml(graph, STREETS_FILE)
+    print(f"Wrote {STREETS_FILE} ({len(graph.nodes)} nodes, {len(graph.edges)} edges)")
+    return graph
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--refresh", action="store_true", help="bypass cache, re-fetch from Overpass")
+    ap.add_argument("--refresh", action="store_true", help="re-download from Overpass even if cached")
     args = ap.parse_args()
     load_buildings(refresh=args.refresh)
-    fetch_street_network(refresh=args.refresh)
+    load_streets(refresh=args.refresh)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+osmnx>=2.0             # features_from_place + automatic splitting of big Overpass queries
+geopandas
+pyarrow                # GeoParquet cache (backend/data/buildings.parquet)
+shapely>=2.1           # orient_polygons, vectorised geometry
+numpy
+pyproj
+pysolar
+mapbox-vector-tile>=2.0
+tzdata                 # zoneinfo has no timezone database of its own on Windows
+
+# tests
+pytest
+httpx                  # fastapi.testclient
