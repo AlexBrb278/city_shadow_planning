@@ -3,3 +3,36 @@ body {
 	height: 100%;
 	margin: 0;
 }
+
+:root {
+	--panel-bg: rgb(255 255 255 / 0.94);
+	--panel-fg: #1f2633;
+	--panel-muted: #4a5466;
+	--panel-border: #c9d0db;
+	--input-bg: #fff;
+	--error: #b42318;
+	--accent-sun: #e0a526;
+	--route-shady: #0e8f7e;
+	/* Drawn over the (unthemed) basemap, so the same in both themes. */
+	--route-fast: #3d4656;
+}
+
+@media (prefers-color-scheme: dark) {
+	:root {
+		color-scheme: dark;
+		--panel-bg: rgb(24 29 38 / 0.94);
+		--panel-fg: #e8ecf2;
+		--panel-muted: #a3adbd;
+		--panel-border: #3b4556;
+		--input-bg: #1c222c;
+		--error: #ff8a7a;
+		--route-shady: #2fd1b9;
+	}
+}
+
+/* Phones pinch, rotate and tilt; the map's buttons would sit under the route panel. */
+@media (max-width: 600px) {
+	.maplibregl-ctrl-top-right .maplibregl-ctrl-group {
+		display: none;
+	}
+}

@@ -63,18 +63,18 @@
 	.panel {
 		position: absolute;
 		left: 50%;
-		bottom: 32px;
+		bottom: max(24px, env(safe-area-inset-bottom));
 		transform: translateX(-50%);
-		width: min(480px, calc(100% - 32px));
+		width: min(480px, calc(100% - 24px));
 		box-sizing: border-box;
 		padding: 12px 16px;
 		display: grid;
 		gap: 8px;
-		background: rgb(255 255 255 / 0.94);
+		background: var(--panel-bg);
 		border-radius: 12px;
 		box-shadow: 0 4px 16px rgb(0 0 0 / 0.18);
 		font: 14px/1.3 system-ui, sans-serif;
-		color: #1f2633;
+		color: var(--panel-fg);
 	}
 	.row {
 		display: flex;
@@ -95,9 +95,9 @@
 	button {
 		font: inherit;
 		padding: 4px 8px;
-		border: 1px solid #c9d0db;
+		border: 1px solid var(--panel-border);
 		border-radius: 6px;
-		background: #fff;
+		background: var(--input-bg);
 		color: inherit;
 	}
 	button {
@@ -106,13 +106,13 @@
 	input[type='range'] {
 		width: 100%;
 		margin: 0;
-		accent-color: #e0a526;
+		accent-color: var(--accent-sun);
 	}
 	.status {
 		margin: 0;
-		color: #4a5466;
+		color: var(--panel-muted);
 	}
 	.status.error {
-		color: #b42318;
+		color: var(--error);
 	}
 </style>

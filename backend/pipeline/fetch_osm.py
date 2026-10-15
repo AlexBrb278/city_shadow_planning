@@ -10,6 +10,8 @@ Usage:
 """
 
 import argparse
+import os
+import time
 from pathlib import Path
 
 import geopandas as gpd
@@ -23,8 +25,13 @@ PLACE = "Bucharest, Romania"
 # sub-queries no larger than this (5 km x 5 km) and merges the results.
 MAX_QUERY_AREA_M2 = 25_000_000
 REQUEST_TIMEOUT_S = 300
+# Overpass often answers 502/504 under load. Finished sub-queries are cached
+# (see _configure_osmnx), so a retry picks up where the last attempt stopped.
+RETRIES = 4
+RETRY_WAIT_S = 60
 
-DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+# UMBRA_DATA_DIR points the pipeline and API at another set of cached data.
+DATA_DIR = Path(os.environ.get("UMBRA_DATA_DIR") or Path(__file__).resolve().parents[1] / "data")
 CACHE_FILE = DATA_DIR / "buildings.parquet"
 STREETS_FILE = DATA_DIR / "streets.graphml"
 
@@ -32,9 +39,24 @@ STREETS_FILE = DATA_DIR / "streets.graphml"
 def _configure_osmnx():
     import osmnx as ox
 
+    ox.settings.cache_folder = str(DATA_DIR / "overpass_cache")
     ox.settings.max_query_area_size = MAX_QUERY_AREA_M2
     ox.settings.requests_timeout = REQUEST_TIMEOUT_S
     return ox
+
+
+def with_retries(download, what):
+    """Run `download()`, retrying after Overpass/network errors."""
+    for attempt in range(1, RETRIES + 1):
+        try:
+            return download()
+        except Exception as e:  # osmnx raises several types for server trouble
+            if attempt == RETRIES:
+                raise
+            wait = RETRY_WAIT_S * attempt
+            print(f"Downloading {what} failed ({type(e).__name__}: {str(e)[:120]}); "
+                  f"attempt {attempt}/{RETRIES}, retrying in {wait} s")
+            time.sleep(wait)
 
 
 def polygons_only(gdf):
@@ -52,7 +74,7 @@ def fetch_buildings(place=PLACE):
     GeoDataFrame (WGS84) with height_m, height_source, building_type, osm_id."""
     ox = _configure_osmnx()
 
-    osm = ox.features_from_place(place, tags={"building": True})
+    osm = with_retries(lambda: ox.features_from_place(place, tags={"building": True}), "buildings")
     osm = osm[osm.geom_type.isin(["Polygon", "MultiPolygon"])]
 
     heights, sources = resolve_heights(osm)
@@ -92,7 +114,7 @@ def load_streets(refresh=False, place=PLACE):
         print(f"Using cached streets: {STREETS_FILE}")
         return ox.load_graphml(STREETS_FILE)
 
-    graph = ox.graph_from_place(place, network_type="walk")
+    graph = with_retries(lambda: ox.graph_from_place(place, network_type="walk"), "streets")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     ox.save_graphml(graph, STREETS_FILE)
     print(f"Wrote {STREETS_FILE} ({len(graph.nodes)} nodes, {len(graph.edges)} edges)")

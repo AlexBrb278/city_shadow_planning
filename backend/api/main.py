@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Umbra API - serves Bucharest's buildings and their shade as map tiles.
+"""Umbra API - serves Bucharest's buildings and their shade as map tiles, and
+shade-aware walking routes.
 
-Buildings load once, at startup (see fetch_osm.py for the cache). Tiles are
-built on demand and kept in memory, so each one is computed once.
+Buildings and streets load once, at startup (see fetch_osm.py for the cache).
+Shade is built per tile on demand and kept in memory, so each tile is
+computed once per moment - for the map and for routing alike.
 
 Run: uvicorn main:app --reload --app-dir backend/api
 """
@@ -12,6 +14,7 @@ from contextlib import asynccontextmanager
 from functools import cache, lru_cache
 from pathlib import Path
 
+import numpy as np
 import shapely
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,8 +23,11 @@ from fastapi.middleware.gzip import GZipMiddleware
 import tiles
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pipeline"))
-from buildings import Buildings  # noqa: E402
+import routing  # noqa: E402  (uses pipeline modules)
+from buildings import WEB_MERCATOR, Buildings  # noqa: E402
+from edge_shade import shaded_lengths_in_tile  # noqa: E402
 from shadows import shade_near  # noqa: E402
+from streets import Streets  # noqa: E402
 from sun import local_datetime, sun_at  # noqa: E402
 
 # Buildings and shade are served as zoom-15 tiles (~870 m across in
@@ -43,11 +49,24 @@ def city():
     return Buildings.load()
 
 
+@cache
+def streets():
+    return Streets.load()
+
+
+@cache
+def to_mercator():
+    from pyproj import Transformer
+
+    return Transformer.from_crs("EPSG:4326", WEB_MERCATOR, always_xy=True)
+
+
 @asynccontextmanager
 async def lifespan(app):
     # Load before serving: MapLibre asks for a dozen tiles at once, and each
     # would otherwise start loading the whole city in parallel.
     city()
+    streets()
     yield
 
 
@@ -132,10 +151,54 @@ def building_tile_bytes(z, x, y):
 
 
 @lru_cache(maxsize=4096)
-def shade_tile_bytes(z, x, y, date, time):
-    bounds = tiles.tile_bounds(z, x, y)
+def shade_tile_geometry(z, x, y, date, time):
+    """The shade over tile z/x/y (a little beyond it, see tiles.BUFFER)."""
     position = sun_at(local_datetime(date, time))
-    shade = shade_near(city(), position, tiles.buffered(bounds))
+    return shade_near(city(), position, tiles.buffered(tiles.tile_bounds(z, x, y)))
+
+
+@lru_cache(maxsize=4096)
+def shade_tile_bytes(z, x, y, date, time):
+    shade = shade_tile_geometry(z, x, y, date, time)
     if shade.is_empty:
         return b""
-    return tiles.encode("shade", shapely.get_parts(shade), bounds)
+    return tiles.encode("shade", shapely.get_parts(shade), tiles.tile_bounds(z, x, y))
+
+
+@lru_cache(maxsize=4096)
+def edge_shade_tile(z, x, y, date, time):
+    """Shaded lengths of the street edges in tile z/x/y (see edge_shade.py)."""
+    shade = shade_tile_geometry(z, x, y, date, time)
+    return shaded_lengths_in_tile(streets(), shade, tiles.tile_bounds(z, x, y))
+
+
+@app.get("/route")
+def route(
+    from_lat: float = Query(..., ge=-90, le=90),
+    from_lon: float = Query(..., ge=-180, le=180),
+    to_lat: float = Query(..., ge=-90, le=90),
+    to_lon: float = Query(..., ge=-180, le=180),
+    date: str = DATE,
+    time: str = TIME,
+    shade: float = Query(0.75, ge=0, le=1, description="0 = fastest, 1 = strongly prefer shade"),
+):
+    """The fastest walking route and the shade-preferring one, as GeoJSON
+    Features with distance_m, duration_min and shade_pct, plus their delta."""
+    when = moment(date, time)
+    sun_up = sun_at(when).is_up
+    start = to_mercator().transform(from_lon, from_lat)
+    end = to_mercator().transform(to_lon, to_lat)
+
+    def fractions_for(start_xy, end_xy):
+        if not sun_up:  # the whole city is in shade
+            return np.ones(len(streets()))
+        corridor = routing.corridor_tiles(start_xy, end_xy, TILE_ZOOM)
+        return routing.corridor_fractions(
+            streets(), corridor, lambda x, y: edge_shade_tile(TILE_ZOOM, x, y, date, time)
+        )
+
+    try:
+        result = routing.plan(streets(), start, end, shade, fractions_for)
+    except routing.RouteError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return {"time": when.isoformat(), "sun_up": sun_up, **result}

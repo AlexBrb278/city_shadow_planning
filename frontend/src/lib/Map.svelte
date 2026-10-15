@@ -2,18 +2,47 @@
 	import { onMount } from 'svelte';
 	import {
 		Map as MaplibreMap,
+		Marker,
 		NavigationControl,
+		type GeoJSONSource,
 		type LightSpecification,
 		type VectorTileSource
 	} from 'maplibre-gl';
+	import type { FeatureCollection } from 'geojson';
 	import 'maplibre-gl/dist/maplibre-gl.css';
-	import { TILE_ZOOM, buildingTilesUrl, shadeTilesUrl, type Moment, type Sun } from '$lib/api';
+	import {
+		TILE_ZOOM,
+		buildingTilesUrl,
+		shadeTilesUrl,
+		type LngLat,
+		type Moment,
+		type RouteResult,
+		type Sun
+	} from '$lib/api';
 
 	let {
 		moment,
 		sun,
-		loading = $bindable(false)
-	}: { moment: Moment; sun: Sun | null; loading?: boolean } = $props();
+		loading = $bindable(false),
+		from = null,
+		to = null,
+		route = null,
+		onpick,
+		onmove
+	}: {
+		moment: Moment;
+		sun: Sun | null;
+		loading?: boolean;
+		from?: LngLat | null;
+		to?: LngLat | null;
+		route?: RouteResult | null;
+		/** A tap on the map. */
+		onpick?: (at: LngLat) => void;
+		/** A start/finish marker was dragged somewhere new. */
+		onmove?: (which: 'from' | 'to', at: LngLat) => void;
+	} = $props();
+
+	const NO_ROUTES: FeatureCollection = { type: 'FeatureCollection', features: [] };
 
 	// Lipscani / Old Town. The whole city is available; this is just where we start.
 	const START: [number, number] = [26.101, 44.431];
@@ -54,6 +83,7 @@
 		map = m;
 
 		m.addControl(new NavigationControl());
+		m.on('click', (e) => onpick?.([e.lngLat.lng, e.lngLat.lat]));
 		m.on('zoom', () => (zoom = m.getZoom()));
 		// Shade is current once every tile for the moment has arrived or
 		// failed. (Not 'idle': that also waits on basemap tiles, and never
@@ -112,6 +142,45 @@
 					'fill-extrusion-opacity': 0.85
 				}
 			});
+
+			// Routes go on top. Fastest: thin grey dashes; shady: bold, cased.
+			m.addSource('routes', { type: 'geojson', data: NO_ROUTES });
+			const style = getComputedStyle(container);
+			const shady = style.getPropertyValue('--route-shady').trim() || '#0e8f7e';
+			const fast = style.getPropertyValue('--route-fast').trim() || '#3d4656';
+			const lineLayout = { 'line-cap': 'round', 'line-join': 'round' } as const;
+			m.addLayer({
+				id: 'route-fastest-casing',
+				type: 'line',
+				source: 'routes',
+				filter: ['==', ['get', 'kind'], 'fastest'],
+				layout: lineLayout,
+				paint: { 'line-color': '#ffffff', 'line-width': 7, 'line-opacity': 0.8 }
+			});
+			m.addLayer({
+				id: 'route-fastest',
+				type: 'line',
+				source: 'routes',
+				filter: ['==', ['get', 'kind'], 'fastest'],
+				layout: lineLayout,
+				paint: { 'line-color': fast, 'line-width': 3.5, 'line-dasharray': [2, 1.5] }
+			});
+			m.addLayer({
+				id: 'route-shady-casing',
+				type: 'line',
+				source: 'routes',
+				filter: ['==', ['get', 'kind'], 'shady'],
+				layout: lineLayout,
+				paint: { 'line-color': '#ffffff', 'line-width': 10, 'line-opacity': 0.9 }
+			});
+			m.addLayer({
+				id: 'route-shady',
+				type: 'line',
+				source: 'routes',
+				filter: ['==', ['get', 'kind'], 'shady'],
+				layout: lineLayout,
+				paint: { 'line-color': shady, 'line-width': 6 }
+			});
 			ready = true;
 		});
 
@@ -126,6 +195,41 @@
 		shadeUrl = url;
 		(map.getSource('shade') as VectorTileSource).setTiles([url]);
 		loading = true;
+	});
+
+	$effect(() => {
+		if (!ready || !map) return;
+		const data: FeatureCollection = route
+			? { type: 'FeatureCollection', features: [route.fastest, route.shady] }
+			: NO_ROUTES;
+		(map.getSource('routes') as GeoJSONSource).setData(data);
+	});
+
+	// Start and finish markers, draggable to adjust the trip.
+	let markers: Partial<Record<'from' | 'to', Marker>> = {};
+	function syncMarker(which: 'from' | 'to', at: LngLat | null, color: string) {
+		if (!map) return;
+		if (!at) {
+			markers[which]?.remove();
+			delete markers[which];
+			return;
+		}
+		if (!markers[which]) {
+			const marker = new Marker({ color, draggable: true }).setLngLat(at).addTo(map);
+			marker.on('dragend', () => {
+				const p = marker.getLngLat();
+				onmove?.(which, [p.lng, p.lat]);
+			});
+			markers[which] = marker;
+		} else {
+			markers[which].setLngLat(at);
+		}
+	}
+	$effect(() => {
+		if (ready) syncMarker('from', from, '#2f9e44');
+	});
+	$effect(() => {
+		if (ready) syncMarker('to', to, '#d6336c');
 	});
 
 	// Light the 3D buildings from where the sun is. MapLibre's polar angle is
@@ -158,7 +262,7 @@
 	}
 	.hint {
 		position: absolute;
-		top: 16px;
+		bottom: 170px;
 		left: 50%;
 		transform: translateX(-50%);
 		margin: 0;
