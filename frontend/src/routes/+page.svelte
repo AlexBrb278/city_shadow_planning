@@ -224,7 +224,7 @@
 <Map
 	{moment}
 	{sun}
-	sunStrength={weather?.sun_strength ?? 1}
+	{weather}
 	bind:loading={tilesLoading}
 	from={startIsMe ? null : from}
 	{to}
@@ -242,6 +242,7 @@
 	from={start}
 	{to}
 	bind:shade
+	raining={weather?.is_raining ?? false}
 	result={route}
 	loading={routing}
 	error={routeError ?? locationError}

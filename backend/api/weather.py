@@ -26,7 +26,9 @@ TIMEOUT_S = 4.0
 # A day's forecast is refetched after this long; past days never change.
 FORECAST_TTL_S = 30 * 60
 
-# Rain heavier than this (mm in the hour), or this likely, counts as raining.
+# Rain heavier than this (mm in the hour) counts as raining. The chance of
+# rain only decides when there's no weather code: the hourly code already
+# weighs it, and a 70% chance under a "partly cloudy" code is a dry hour.
 RAIN_MM = 0.2
 RAIN_PROBABILITY_PCT = 60
 
@@ -58,11 +60,11 @@ class Weather:
 
     @property
     def is_raining(self):
-        return (
-            self.precipitation_mm >= RAIN_MM
-            or (self.precipitation_probability_pct or 0) >= RAIN_PROBABILITY_PCT
-            or self.weather_code in WET_CODES
-        )
+        if self.precipitation_mm >= RAIN_MM:
+            return True
+        if self.weather_code is None:
+            return (self.precipitation_probability_pct or 0) >= RAIN_PROBABILITY_PCT
+        return self.weather_code in WET_CODES
 
     @property
     def sun_strength(self):

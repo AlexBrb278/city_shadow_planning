@@ -5,6 +5,7 @@
 		from,
 		to,
 		shade = $bindable(),
+		raining = false,
 		result,
 		loading = false,
 		error = null,
@@ -18,6 +19,8 @@
 		from: LngLat | null;
 		to: LngLat | null;
 		shade: number;
+		/** In rain shade doesn't matter, so the preference is set aside. */
+		raining?: boolean;
 		result: RouteResult | null;
 		loading?: boolean;
 		error?: string | null;
@@ -31,7 +34,7 @@
 	} = $props();
 
 	const PREFERENCES = ['Fastest', 'A little', 'Some', 'Lots', 'Max shade'];
-	let label = $derived(PREFERENCES[Math.round(shade * (PREFERENCES.length - 1))]);
+	let label = $derived(raining ? 'Off in rain' : PREFERENCES[Math.round(shade * (PREFERENCES.length - 1))]);
 
 	function minutes(m: number): string {
 		const rounded = Math.round(Math.abs(m));
@@ -91,7 +94,7 @@
 		<p class="hint">Finding routes…</p>
 	{/if}
 
-	<div class="row">
+	<div class="row" class:off={raining}>
 		<label for="shade-pref">Shade <span class="pref">{label}</span></label>
 		<input
 			id="shade-pref"
@@ -100,6 +103,7 @@
 			max="1"
 			step="0.25"
 			bind:value={shade}
+			disabled={raining}
 			aria-valuetext={label}
 		/>
 		{#if to || (from && !startIsMe)}
@@ -205,6 +209,15 @@
 		min-width: 0;
 		margin: 0;
 		accent-color: var(--route-shady);
+	}
+	.off label,
+	.off .pref,
+	.off input[type='range'] {
+		opacity: 0.45;
+		filter: grayscale(1);
+	}
+	.off input[type='range'] {
+		cursor: not-allowed;
 	}
 	button {
 		font: inherit;

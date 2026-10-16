@@ -43,7 +43,8 @@ def make(**kw):
         ({"cloud_cover_pct": 100.0, "weather_code": 3}, False, 0.1),
         ({"cloud_cover_pct": 50.0}, False, 0.55),
         ({"precipitation_mm": 1.2, "weather_code": 63}, True, 0.0),
-        ({"precipitation_probability_pct": 80}, True, 0.0),
+        ({"precipitation_probability_pct": 80, "weather_code": 2, "cloud_cover_pct": 50.0}, False, 0.55),
+        ({"precipitation_probability_pct": 80, "weather_code": None}, True, 0.0),
         ({"weather_code": 61}, True, 0.0),  # light rain coded, nothing measured yet
     ],
 )

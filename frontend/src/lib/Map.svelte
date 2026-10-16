@@ -20,14 +20,16 @@
 		type LngLat,
 		type Moment,
 		type RouteResult,
-		type Sun
+		type Sun,
+		type Weather
 	} from '$lib/api';
 	import type { Fix } from '$lib/geolocation';
+	import WeatherFx from '$lib/WeatherFx.svelte';
 
 	let {
 		moment,
 		sun,
-		sunStrength = 1,
+		weather = null,
 		loading = $bindable(false),
 		from = null,
 		to = null,
@@ -43,8 +45,8 @@
 	}: {
 		moment: Moment;
 		sun: Sun | null;
-		/** 0..1 from the weather: how strongly shadows show. */
-		sunStrength?: number;
+		/** Shadows fade under cloud and go in rain; the sky shows over the map. */
+		weather?: Weather | null;
 		loading?: boolean;
 		/** Start pin, when the start isn't the walker's own position. */
 		from?: LngLat | null;
@@ -85,6 +87,8 @@
 	let zoom = $state(16.5);
 	let bearing = $state(-17);
 	let shadeUrl = ''; // the shade tile URL the map currently uses
+	let sunStrength = $derived(weather?.sun_strength ?? 1);
+	let raining = $derived(weather?.is_raining ?? false);
 
 	onMount(() => {
 		const m = new MaplibreMap({
@@ -162,6 +166,7 @@
 				type: 'fill',
 				source: 'shade',
 				'source-layer': 'shade',
+				layout: { visibility: raining ? 'none' : 'visible' },
 				paint: {
 					'fill-color': '#0f1a33',
 					'fill-opacity': shadeOpacity(sunStrength)
@@ -262,6 +267,11 @@
 
 	$effect(() => {
 		if (ready && map) map.setPaintProperty('shade', 'fill-opacity', shadeOpacity(sunStrength));
+	});
+
+	// No sun gets through rain clouds, so there's no shade to show.
+	$effect(() => {
+		if (ready && map) map.setLayoutProperty('shade', 'visibility', raining ? 'none' : 'visible');
 	});
 
 	// A new moment means new shade tiles; MapLibre keeps showing the old ones
@@ -385,6 +395,7 @@
 </script>
 
 <div bind:this={container} class="map"></div>
+<WeatherFx {weather} />
 
 <div class="controls">
 	<button type="button" onclick={() => rotate(-ROTATE_STEP)} aria-label="Rotate left" title="Rotate left">
@@ -428,7 +439,7 @@
 <!-- MapLibre zoom levels count 512 px tiles, the size vector tiles are drawn at,
 	so zoom-15 tiles show from map zoom 15. -->
 {#if zoom < TILE_ZOOM}
-	<p class="hint">Zoom in to see buildings and shade</p>
+	<p class="hint">Zoom in to see buildings{raining ? '' : ' and shade'}</p>
 {/if}
 
 <style>
